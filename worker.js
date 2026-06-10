@@ -4,6 +4,7 @@
  * 新增：用户/管理员编辑消息双向同步（用户编辑→管理侧原消息+提醒；管理员编辑→用户侧原消息无提醒）
  * 修复：原始信息永久保留第一次发送的内容，不被后续编辑覆盖
  * 调整：屏蔽/解除屏蔽向用户发送提醒；用户资料卡移除首次连接时间并去除<code>标签
+ * 优化：删除未使用的首次连接时间存储逻辑，清理冗余参数
  */
 
 // --- 辅助函数 ---
@@ -16,7 +17,7 @@ function escapeHtml(text) {
       .replace(/>/g, '&gt;');
 }
 
-function getUserInfo(user, initialTimestamp = null) {
+function getUserInfo(user) {
   const userId = user.id.toString();
   const rawName = (user.first_name || "") + (user.last_name ? ` ${user.last_name}` : "");
   const rawUsername = user.username ? `@${user.username}` : "无";
@@ -286,11 +287,9 @@ async function handleVerification(chatId, answer, env) {
 }
 
 async function handleRelayToTopic(message, env) {
-    const { from: user, date } = message;
-    const { userId, name, username, topicName, infoCard } = getUserInfo(user, date);
+    const { from: user } = message;
+    const { userId, name, username, topicName, infoCard } = getUserInfo(user);
     let topicId = await env.TG_BOT_KV.get(`user_topic:${userId}`);
-    let storedInfoJson = await env.TG_BOT_KV.get(`user_info:${userId}`);
-    let storedInfo = storedInfoJson ? JSON.parse(storedInfoJson) : null;
     const isBlocked = await env.TG_BOT_KV.get(`is_blocked:${userId}`) === "true";
 
     const createTopicForUser = async () => {
@@ -304,7 +303,8 @@ async function handleRelayToTopic(message, env) {
             await env.TG_BOT_KV.put(`user_topic:${userId}`, newTopicId);
             await env.TG_BOT_KV.put(`topic_user:${newTopicId}`, userId);
 
-            const newInfo = { name, username, first_message_timestamp: date };
+            // 仅存储必要信息（移除未使用的first_message_timestamp）
+            const newInfo = { name, username };
             await env.TG_BOT_KV.put(`user_info:${userId}`, JSON.stringify(newInfo));
 
             await telegramApi(env.BOT_TOKEN, "sendMessage", {
@@ -328,7 +328,7 @@ async function handleRelayToTopic(message, env) {
         } catch (e) {
             await telegramApi(env.BOT_TOKEN, "sendMessage", {
                 chat_id: userId,
-                text: "抱歉，无法连接客服（创建话题失败）。请稍后再试。",
+                text: "抱歉，无法连接（创建话题失败）。请稍后再试。",
             });
             return;
         }
@@ -380,7 +380,7 @@ async function handleRelayToTopic(message, env) {
             console.error("在处理话题失效时，创建新话题失败:", createErr?.message || createErr);
             await telegramApi(env.BOT_TOKEN, "sendMessage", {
                 chat_id: userId,
-                text: "抱歉，无法创建新的客服话题（请稍后再试）。",
+                text: "抱歉，无法创建新的话题（请稍后再试）。",
             });
             return;
         }
@@ -470,9 +470,8 @@ ${escapeHtml(newContent)}
   }
 }
 
-async function updateTopicAndSendCard(user, topicId, newName, newUsername, newTopicName, initialTimestamp, env) {
-  const { userId, infoCard: newInfoCard } = getUserInfo(user, initialTimestamp);
-  
+async function updateTopicAndSendCard(user, topicId, newName, newUsername, newTopicName, env) {
+  const { userId, infoCard: newInfoCard } = getUserInfo(user);  
   try {
       const isBlocked = await env.TG_BOT_KV.get(`is_blocked:${userId}`) === "true";
       await telegramApi(env.BOT_TOKEN, "editForumTopic", {
@@ -497,7 +496,7 @@ async function updateTopicAndSendCard(user, topicId, newName, newUsername, newTo
           reply_markup: getActionButton(userId, isBlocked),
       });
       
-      const updatedInfo = { name: newName, username: newUsername, first_message_timestamp: initialTimestamp };
+      const updatedInfo = { name: newName, username: newUsername };
       await env.TG_BOT_KV.put(`user_info:${userId}`, JSON.stringify(updatedInfo));
 
   } catch (e) {
@@ -507,8 +506,7 @@ async function updateTopicAndSendCard(user, topicId, newName, newUsername, newTo
 
 async function handleCallbackQuery(callbackQuery, env) {
   const { data, message } = callbackQuery;
-  const [action, userId] = data.split(':');
-  
+  const [action, userId] = data.split(':');  
   if (message.chat.id.toString() !== env.ADMIN_GROUP_ID) return; 
 
   await telegramApi(env.BOT_TOKEN, "answerCallbackQuery", {
