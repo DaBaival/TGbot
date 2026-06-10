@@ -6,6 +6,7 @@
  * 调整：屏蔽/解除屏蔽向用户发送提醒；用户资料卡移除首次连接时间并去除<code>标签
  * 优化：删除未使用的首次连接时间存储逻辑，清理冗余参数
  * 修复：语法错误、落地话题名动态管理功能
+ * 优化：删除冗余的`latest_msg_data` KV存储，减少写入次数
  */
 
 // --- 辅助函数 ---
@@ -313,7 +314,7 @@ async function handleRelayToTopic(message, env) {
                 text: infoCard,
                 message_thread_id: newTopicId,
                 parse_mode: "HTML",
-                reply_markup: getActionButton(userId, isBlocked), // 修复：添加逗号
+                reply_markup: getActionButton(userId, isBlocked),
             });
 
             return newTopicId;
@@ -469,14 +470,7 @@ async function handleRelayEditedMessage(editedMessage, env) {
       await env.TG_BOT_KV.put(noticeKey, sentNotice.message_id.toString());
     }
 
-    // 不更新msg_data的原始内容！仅存储最新内容到其他键
-    const latestDataKey = `latest_msg_data:${userId}:${userMsgId}`;
-    const latestData = { 
-      text: newContent,
-      date: JSON.parse(storedDataJson).date
-    };
-    await env.TG_BOT_KV.put(latestDataKey, JSON.stringify(latestData));
-    
+    // ✅ 已删除冗余的 latest_msg_data 存储逻辑，减少 KV 写入
   } catch (e) {
     console.error("处理已编辑消息失败:", e.message);
   }
@@ -507,10 +501,6 @@ async function updateTopicAndSendCard(user, topicId, newName, newUsername, newTo
           parse_mode: "HTML",
           reply_markup: getActionButton(userId, isBlocked),
       });
-      
-      const updatedInfo = { name: newName, username: newUsername };
-      await env.TG_BOT_KV.put(`user_info:${userId}`, JSON.stringify(updatedInfo));
-
   } catch (e) {
       console.error(`更新话题或发送信息卡失败 (Topic ID: ${topicId}):`, e.message);
   }
