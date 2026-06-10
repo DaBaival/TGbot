@@ -27,13 +27,13 @@ function getUserInfo(user) {
   const safeUserId = escapeHtml(userId);
   const topicName = `${rawName.trim()} | ${userId}`.substring(0, 128);
   
-  // 移除首次连接时间，去除<code>标签
+  // 移除首次连接时间
   const infoCard = `
 <b>👤 用户资料卡</b>
 ---
-• 昵称/名称: ${safeName}
+• 昵称/名称: <code>${safeName}</code>
 • 用户名: ${safeUsername}
-• ID: ${safeUserId}
+• ID: <code>${safeUserId}</code>
   `.trim();
 
   return { userId, name: rawName, username: rawUsername, topicName, infoCard };
@@ -435,7 +435,7 @@ async function handleRelayEditedMessage(editedMessage, env) {
 <code>${escapeHtml(originalText)}</code>
 
 <b>修改后的新内容:</b>
-${escapeHtml(newContent)}
+<code>${escapeHtml(newContent)}</code>
   `.trim();
 
   try {
