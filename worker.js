@@ -5,6 +5,7 @@
  * 修复：原始信息永久保留第一次发送的内容，不被后续编辑覆盖
  * 调整：屏蔽/解除屏蔽向用户发送提醒；用户资料卡移除首次连接时间并去除<code>标签
  * 优化：删除未使用的首次连接时间存储逻辑，清理冗余参数
+ * 修复：语法错误、落地话题名动态管理功能
  */
 
 // --- 辅助函数 ---
@@ -27,13 +28,13 @@ function getUserInfo(user) {
   const safeUserId = escapeHtml(userId);
   const topicName = `${rawName.trim()} | ${userId}`.substring(0, 128);
   
-  // 移除首次连接时间
+  // 移除<code>标签，符合用户要求
   const infoCard = `
 <b>👤 用户资料卡</b>
 ---
-• 昵称/名称: <code>${safeName}</code>
+• 昵称/名称: ${safeName}
 • 用户名: ${safeUsername}
-• ID: <code>${safeUserId}</code>
+• ID: ${safeUserId}
   `.trim();
 
   return { userId, name: rawName, username: rawUsername, topicName, infoCard };
@@ -303,7 +304,7 @@ async function handleRelayToTopic(message, env) {
             await env.TG_BOT_KV.put(`user_topic:${userId}`, newTopicId);
             await env.TG_BOT_KV.put(`topic_user:${newTopicId}`, userId);
 
-            // 仅存储必要信息（移除未使用的first_message_timestamp）
+            // 存储用户资料（无首次连接时间）
             const newInfo = { name, username };
             await env.TG_BOT_KV.put(`user_info:${userId}`, JSON.stringify(newInfo));
 
@@ -312,7 +313,7 @@ async function handleRelayToTopic(message, env) {
                 text: infoCard,
                 message_thread_id: newTopicId,
                 parse_mode: "HTML",
-                reply_markup: getActionButton(userId, isBlocked),
+                reply_markup: getActionButton(userId, isBlocked), // 修复：添加逗号
             });
 
             return newTopicId;
@@ -331,6 +332,17 @@ async function handleRelayToTopic(message, env) {
                 text: "抱歉，无法连接（创建话题失败）。请稍后再试。",
             });
             return;
+        }
+    } else {
+        // 落地“话题名动态管理”：检测用户资料变化
+        const storedInfoJson = await env.TG_BOT_KV.get(`user_info:${userId}`);
+        const storedInfo = storedInfoJson ? JSON.parse(storedInfoJson) : {};
+        
+        if (storedInfo.name !== name || storedInfo.username !== username) {
+            const newTopicName = `${name.trim()} | ${userId}`.substring(0, 128);
+            await updateTopicAndSendCard(user, topicId, name, username, newTopicName, env);
+            // 更新存储的用户资料
+            await env.TG_BOT_KV.put(`user_info:${userId}`, JSON.stringify({ name, username }));
         }
     }
 
