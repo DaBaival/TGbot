@@ -1,12 +1,16 @@
 /**
  * Telegram 双向机器人 Cloudflare Worker
  * 实现了：人机验证、私聊到话题模式的转发、管理员回复中继、话题名动态更新、已编辑消息处理、用户屏蔽功能、关键词自动回复
- * 新增：用户/管理员编辑消息双向同步（用户编辑→管理侧原消息+提醒；管理员编辑→用户侧原消息无提醒）
+ * 新增：用户/管理员编辑消息双向同步（支持图片+文本混合消息）
  * 修复：原始信息永久保留第一次发送的内容，不被后续编辑覆盖
  * 调整：屏蔽/解除屏蔽向用户发送提醒；用户资料卡移除首次连接时间并去除<code>标签
  * 优化：删除未使用的首次连接时间存储逻辑，清理冗余参数
  * 修复：语法错误、落地话题名动态管理功能
  * 优化：删除冗余的`latest_msg_data` KV存储，减少写入次数
+ * ✅ 新增：媒体消息编辑同步（用户更换图片/修改说明，管理员同步更新）
+ * ✅ 新增：管理员编辑媒体消息同步到用户（支持更换图片/修改说明）
+ * 🔧 优化：移除图片说明编辑提醒，仅保留文本消息编辑提醒
+ * 🔧 优化：代码结构和错误处理，提升稳定性
  */
 
 // --- 辅助函数 ---
@@ -29,7 +33,6 @@ function getUserInfo(user) {
   const safeUserId = escapeHtml(userId);
   const topicName = `${rawName.trim()} | ${userId}`.substring(0, 128);
   
-  // 移除<code>标签，符合用户要求
   const infoCard = `
 <b>👤 用户资料卡</b>
 ---
@@ -121,6 +124,34 @@ async function telegramApi(token, methodName, params = {}) {
     return data.result;
 }
 
+async function telegramApiEditMedia(token, params = {}) {
+    const url = `https://api.telegram.org/bot${token}/editMessageMedia`;
+    const body = {
+        ...params,
+        media: typeof params.media === 'string' ? params.media : JSON.stringify(params.media),
+    };
+    const response = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+    });
+
+    let data;
+    try {
+        data = await response.json();
+    } catch (e) {
+        console.error(`Telegram API editMessageMedia 返回非 JSON 响应`, e);
+        throw new Error(`Telegram API editMessageMedia returned non-JSON response`);
+    }
+
+    if (!data.ok) {
+        console.error(`Telegram API error (editMessageMedia): ${data.description}. Params: ${JSON.stringify(params)}. Full response:`, data);
+        throw new Error(`editMessageMedia failed: ${data.description || JSON.stringify(data)}`);
+    }
+
+    return data.result;
+}
+
 // --- 核心更新处理函数 ---
 
 export default {
@@ -160,22 +191,18 @@ async function handlePrivateMessage(message, env) {
   const text = message.text || "";
   const userId = chatId;
 
-  // 检查屏蔽状态
   const isBlocked = await env.TG_BOT_KV.get(`is_blocked:${chatId}`) === "true";
   if (isBlocked) return; 
 
-  // 处理 /start 或 /help
   if (text === "/start" || text === "/help") {
       await handleStart(chatId, env);
       return;
   }
 
-  // 检查验证状态
   const userState = (await env.TG_BOT_KV.get(`user_state:${chatId}`)) || "new";
   if (userState === "pending_verification") {
       await handleVerification(chatId, text, env);
   } else if (userState === "verified") {
-      // 关键词屏蔽检查
       const blockKeywordsValue = env.BLOCK_KEYWORDS;
       const blockThreshold = parseInt(env.BLOCK_THRESHOLD, 10) || 5; 
       
@@ -201,7 +228,6 @@ async function handlePrivateMessage(message, env) {
           }
       }
 
-      // 转发内容过滤检查
       const filters = {
           image: (env.ENABLE_IMAGE_FORWARDING || 'true').toLowerCase() === 'true',
           link: (env.ENABLE_LINK_FORWARDING || 'true').toLowerCase() === 'true',
@@ -240,7 +266,6 @@ async function handlePrivateMessage(message, env) {
           return;
       }
       
-      // 关键词自动回复检查
       const keywordResponsesValue = env.KEYWORD_RESPONSES;
       if (keywordResponsesValue && text) { 
           const autoResponseRules = parseKeywordResponses(keywordResponsesValue);
@@ -253,15 +278,12 @@ async function handlePrivateMessage(message, env) {
           }
       }
       
-      // 转发到管理话题
       await handleRelayToTopic(message, env);
       
   } else {
       await telegramApi(env.BOT_TOKEN, "sendMessage", { chat_id: chatId, text: "请使用 /start 命令开始。" });
   }
 }
-
-// --- 验证逻辑 ---
 
 async function handleStart(chatId, env) {
   const welcomeMessage = env.WELCOME_MESSAGE || "欢迎！在使用之前，请先完成人机验证。";
@@ -305,7 +327,6 @@ async function handleRelayToTopic(message, env) {
             await env.TG_BOT_KV.put(`user_topic:${userId}`, newTopicId);
             await env.TG_BOT_KV.put(`topic_user:${newTopicId}`, userId);
 
-            // 存储用户资料（无首次连接时间）
             const newInfo = { name, username };
             await env.TG_BOT_KV.put(`user_info:${userId}`, JSON.stringify(newInfo));
 
@@ -335,14 +356,12 @@ async function handleRelayToTopic(message, env) {
             return;
         }
     } else {
-        // 落地“话题名动态管理”：检测用户资料变化
         const storedInfoJson = await env.TG_BOT_KV.get(`user_info:${userId}`);
         const storedInfo = storedInfoJson ? JSON.parse(storedInfoJson) : {};
         
         if (storedInfo.name !== name || storedInfo.username !== username) {
             const newTopicName = `${name.trim()} | ${userId}`.substring(0, 128);
             await updateTopicAndSendCard(user, topicId, name, username, newTopicName, env);
-            // 更新存储的用户资料
             await env.TG_BOT_KV.put(`user_info:${userId}`, JSON.stringify({ name, username }));
         }
     }
@@ -364,11 +383,17 @@ async function handleRelayToTopic(message, env) {
 
     try {
         const copyResult = await tryCopyToTopic(topicId);
-        // 存储用户消息ID→管理侧消息ID的映射（用于后续编辑同步）
         await env.TG_BOT_KV.put(
             `user_msg_to_admin:${userId}:${message.message_id}`,
             copyResult.message_id.toString()
         );
+        console.log(`[DEBUG] 存储用户消息映射：${userId}:${message.message_id} → ${copyResult.message_id}`);
+
+        const originalContent = message.text || message.caption || "";
+        if (originalContent) {
+            const messageData = { text: originalContent, date: message.date };
+            await env.TG_BOT_KV.put(`msg_data:${userId}:${message.message_id}`, JSON.stringify(messageData));
+        }
     } catch (e) {
         try {
             await env.TG_BOT_KV.delete(`user_topic:${userId}`);
@@ -381,6 +406,13 @@ async function handleRelayToTopic(message, env) {
                     `user_msg_to_admin:${userId}:${message.message_id}`,
                     copyResult.message_id.toString()
                 );
+                console.log(`[DEBUG] 新话题存储用户消息映射：${userId}:${message.message_id} → ${copyResult.message_id}`);
+
+                const originalContent = message.text || message.caption || "";
+                if (originalContent) {
+                    const messageData = { text: originalContent, date: message.date };
+                    await env.TG_BOT_KV.put(`msg_data:${userId}:${message.message_id}`, JSON.stringify(messageData));
+                }
             } catch (e2) {
                 console.error("尝试将消息复制到新话题也失败:", e2?.message || e2);
                 await telegramApi(env.BOT_TOKEN, "sendMessage", {
@@ -398,12 +430,6 @@ async function handleRelayToTopic(message, env) {
             return;
         }
     }
-
-    // 存储原始内容到msg_data，永远不更新！
-    if (message.text) {
-        const messageData = { text: message.text, date: message.date };
-        await env.TG_BOT_KV.put(`msg_data:${userId}:${message.message_id}`, JSON.stringify(messageData));
-    }
 }
 
 async function handleRelayEditedMessage(editedMessage, env) {
@@ -417,31 +443,78 @@ async function handleRelayEditedMessage(editedMessage, env) {
   let originalText = "[原始内容无法获取/非文本内容]";
   if (storedDataJson) {
     const storedData = JSON.parse(storedDataJson);
-    originalText = storedData.text || originalText; // 永远读取第一次的原始内容
+    originalText = storedData.text || originalText;
   } else return;
 
-  const newContent = editedMessage.text || editedMessage.caption || "[非文本/媒体说明内容]";
-  
-  // 1. 更新管理侧用户原消息（1→2→3，永远同步最新内容）
   const adminMsgKey = `user_msg_to_admin:${userId}:${userMsgId}`;
   const adminMsgId = await env.TG_BOT_KV.get(adminMsgKey);
-  if (adminMsgId) {
+  if (!adminMsgId) {
+    console.error(`[ERROR] 未找到用户消息映射：${adminMsgKey}`);
+    return;
+  }
+  const adminMsgIdNum = parseInt(adminMsgId, 10);
+  if (isNaN(adminMsgIdNum)) {
+    console.error(`[ERROR] 无效的管理端消息ID：${adminMsgId}`);
+    return;
+  }
+
+  // 处理编辑图片：同步图片，不提醒
+  if (editedMessage.photo?.length) {
+    const fileId = editedMessage.photo.at(-1).file_id;
+    try {
+      await telegramApiEditMedia(env.BOT_TOKEN, {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_id: adminMsgIdNum,
+        media: JSON.stringify({
+          type: 'photo',
+          media: fileId,
+          caption: editedMessage.caption || '',
+          parse_mode: 'HTML',
+        }),
+        message_thread_id: topicId,
+      });
+      console.log(`[DEBUG] 用户更换图片同步成功：${adminMsgIdNum}`);
+    } catch (e) {
+      console.error('用户换图失败:', e.message);
+    }
+    return;
+  }
+
+  // 处理编辑图片说明：同步说明，不提醒
+  if (editedMessage.caption !== undefined) {
+    try {
+      await telegramApi(env.BOT_TOKEN, 'editMessageCaption', {
+        chat_id: env.ADMIN_GROUP_ID,
+        message_id: adminMsgIdNum,
+        caption: editedMessage.caption,
+        parse_mode: 'HTML',
+        message_thread_id: topicId,
+      });
+      console.log(`[DEBUG] 用户修改图片说明同步成功：${adminMsgIdNum}`);
+    } catch (e) {
+      console.error('用户改 caption 失败:', e.message);
+    }
+    return;
+  }
+
+  // 仅处理文本消息编辑：保留原有提醒逻辑
+  if (editedMessage.text) {
+    const newContent = editedMessage.text;
+    
     try {
       await telegramApi(env.BOT_TOKEN, "editMessageText", {
         chat_id: env.ADMIN_GROUP_ID,
-        message_id: parseInt(adminMsgId, 10),
+        message_id: adminMsgIdNum,
         text: newContent,
         message_thread_id: topicId,
       });
     } catch (e) {
-      console.error("更新管理侧用户原消息失败:", e.message);
+      console.error("更新管理侧文本消息失败:", e.message);
     }
-  }
 
-  // 2. 复用同一条提醒消息（仅更新修改后的内容，原始信息永远不变）
-  const noticeKey = `edit_notice:${userId}:${userMsgId}`;
-  const existingNoticeId = await env.TG_BOT_KV.get(noticeKey);
-  const notificationText = `
+    const noticeKey = `edit_notice:${userId}:${userMsgId}`;
+    const existingNoticeId = await env.TG_BOT_KV.get(noticeKey);
+    const notificationText = `
 ⚠️ <b>用户消息已修改</b>
 ---
 <b>原始信息:</b> 
@@ -451,28 +524,27 @@ async function handleRelayEditedMessage(editedMessage, env) {
 <code>${escapeHtml(newContent)}</code>
   `.trim();
 
-  try {
-    if (existingNoticeId) {
-      await telegramApi(env.BOT_TOKEN, "editMessageText", {
-        chat_id: env.ADMIN_GROUP_ID,
-        message_id: parseInt(existingNoticeId, 10),
-        text: notificationText,
-        parse_mode: "HTML",
-        message_thread_id: topicId,
-      });
-    } else {
-      const sentNotice = await telegramApi(env.BOT_TOKEN, "sendMessage", {
-        chat_id: env.ADMIN_GROUP_ID,
-        text: notificationText,
-        parse_mode: "HTML",
-        message_thread_id: topicId,
-      });
-      await env.TG_BOT_KV.put(noticeKey, sentNotice.message_id.toString());
+    try {
+      if (existingNoticeId) {
+        await telegramApi(env.BOT_TOKEN, "editMessageText", {
+          chat_id: env.ADMIN_GROUP_ID,
+          message_id: parseInt(existingNoticeId, 10),
+          text: notificationText,
+          parse_mode: "HTML",
+          message_thread_id: topicId,
+        });
+      } else {
+        const sentNotice = await telegramApi(env.BOT_TOKEN, "sendMessage", {
+          chat_id: env.ADMIN_GROUP_ID,
+          text: notificationText,
+          parse_mode: "HTML",
+          message_thread_id: topicId,
+        });
+        await env.TG_BOT_KV.put(noticeKey, sentNotice.message_id.toString());
+      }
+    } catch (e) {
+      console.error("处理文本消息编辑提醒失败:", e.message);
     }
-
-    // ✅ 已删除冗余的 latest_msg_data 存储逻辑，减少 KV 写入
-  } catch (e) {
-    console.error("处理已编辑消息失败:", e.message);
   }
 }
 
@@ -546,7 +618,6 @@ async function handleBlockUser(userId, message, env) {
           parse_mode: "Markdown",
       });
       
-      // 向用户发送屏蔽提醒
       const userNotification = `❌ 您已被屏蔽，机器人将不再接收您的消息。`;
       await telegramApi(env.BOT_TOKEN, "sendMessage", {
           chat_id: userId,
@@ -582,7 +653,6 @@ async function handleUnblockUser(userId, message, env) {
           parse_mode: "Markdown",
       });
 
-      // 向用户发送解除屏蔽提醒
       const userNotification = `✅ 您已解除屏蔽，机器人现在可以正常接收您的消息。`;
       await telegramApi(env.BOT_TOKEN, "sendMessage", {
           chat_id: userId,
@@ -605,6 +675,7 @@ async function handleAdminReply(message, env) {
 
     try {
         let userMessageId;
+        let replyType = 'text';
 
         if (message.text) {
             const result = await telegramApi(env.BOT_TOKEN, "sendMessage", {
@@ -619,12 +690,12 @@ async function handleAdminReply(message, env) {
                 message_id: message.message_id,
             });
             userMessageId = result.message_id;
+            replyType = 'media';
         }
 
-        // 存储管理员消息ID→用户消息ID的映射（用于后续编辑同步）
         const adminMsgKey = `admin_reply:${topicId}:${message.message_id}`;
-        await env.TG_BOT_KV.put(adminMsgKey, userMessageId.toString());
-
+        await env.TG_BOT_KV.put(adminMsgKey, JSON.stringify({ msgId: userMessageId, type: replyType }));
+        console.log(`[DEBUG] 存储管理员消息映射：${topicId}:${message.message_id} → ${userMessageId} (${replyType})`);
     } catch (e) {
         console.error("handleAdminReply 失败:", e.message);
         try {
@@ -688,23 +759,75 @@ async function handleAdminEditReply(editedMessage, env) {
 
   const userId = await env.TG_BOT_KV.get(`topic_user:${topicIdStr}`);
   const adminMsgKey = `admin_reply:${topicIdStr}:${adminMsgId}`;
-  const userMsgId = await env.TG_BOT_KV.get(adminMsgKey);
+  const rawVal = await env.TG_BOT_KV.get(adminMsgKey);
   
-  if (!userId || !userMsgId) return;
+  if (!userId || !rawVal) {
+    console.error(`[ERROR] 未找到管理员消息映射：${adminMsgKey}`);
+    return;
+  }
+
+  let userMsgId, replyType = 'text';
+  try {
+    const parsed = JSON.parse(rawVal);
+    userMsgId = parsed.msgId;
+    replyType = parsed.type || 'text';
+  } catch {
+    userMsgId = Number(rawVal);
+  }
+
+  const userMsgIdNum = Number(userMsgId);
+  if (isNaN(userMsgIdNum)) {
+    console.error(`[ERROR] 无效的用户消息ID：${userMsgId}`);
+    return;
+  }
+
+  if (
+    editedMessage.photo || editedMessage.document ||
+    editedMessage.video || editedMessage.sticker ||
+    editedMessage.audio || editedMessage.voice ||
+    editedMessage.animation || replyType === 'media'
+  ) {
+    if (editedMessage.photo?.length) {
+      const fileId = editedMessage.photo.at(-1).file_id;
+      try {
+        await telegramApiEditMedia(env.BOT_TOKEN, {
+          chat_id: userId,
+          message_id: userMsgIdNum,
+          media: JSON.stringify({
+            type: 'photo',
+            media: fileId,
+            caption: editedMessage.caption || '',
+            parse_mode: 'HTML',
+          }),
+        });
+        console.log(`[DEBUG] 管理员更换图片同步成功：${userMsgIdNum}`);
+      } catch (e) {
+        console.error('管理换图失败:', e.message);
+      }
+    } else if (editedMessage.caption !== undefined) {
+      try {
+        await telegramApi(env.BOT_TOKEN, 'editMessageCaption', {
+          chat_id: userId,
+          message_id: userMsgIdNum,
+          caption: editedMessage.caption,
+          parse_mode: 'HTML',
+        });
+        console.log(`[DEBUG] 管理员修改图片说明同步成功：${userMsgIdNum}`);
+      } catch (e) {
+        console.error('管理改 caption 失败:', e.message);
+      }
+    }
+    return;
+  }
 
   try {
     if (editedMessage.text) {
       await telegramApi(env.BOT_TOKEN, "editMessageText", {
         chat_id: userId,
-        message_id: parseInt(userMsgId, 10),
+        message_id: userMsgIdNum,
         text: editedMessage.text,
       });
-    } else if (editedMessage.caption) {
-      await telegramApi(env.BOT_TOKEN, "editMessageCaption", {
-        chat_id: userId,
-        message_id: parseInt(userMsgId, 10),
-        caption: editedMessage.caption,
-      });
+      console.log(`[DEBUG] 管理员编辑文本同步成功：${userMsgIdNum}`);
     }
   } catch (e) {
     console.error("同步管理员编辑失败:", e.message);
